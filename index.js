@@ -45,4 +45,4 @@ if(ctx.SlashCommandParser&&ctx.SlashCommand) {
         return '';
     });
 }
-console.info(`[${label}] 1.0.0 loaded. Existing display Regex remains responsible for the UI.`);
+console.info(`[${label}] 1.0.1 loaded. Existing display Regex remains responsible for the UI.`);

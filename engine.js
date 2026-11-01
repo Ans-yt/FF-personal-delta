@@ -7,7 +7,33 @@ const idPattern = /^[A-Za-z][A-Za-z0-9_-]{0,79}$/;
 const destinations = ['sw','so','ss','st','sc','sd','si/Materials','si/Objects','si/Skill orbs','si/Equipment','gm','fac'];
 const prefixes = {sw:'wpn',so:'eqp',ss:'skl',st:'ttl',sc:'cnd',sd:'mod',gm:'gm',fac:'fac','si/Materials':'mat','si/Objects':'obj','si/Skill orbs':'orb','si/Equipment':'eqp'};
 const labels = ['ID','Name','Quantity','Type','Class','Grade','Slot','Properties','Composition','Uses','Orb skill/effect','Skill effect','Goal','Intel','Fibs','State','Conflict','Relations','Text'];
-const labelRe = new RegExp(`(^|;\\s*)(${labels.join('|')}):\\s*`, 'g');
+// Effect is a legacy snapshot label, not an allowed delta field.
+const labelRe = new RegExp(`(^|;\\s*)(${[...labels,'Effect'].join('|')}):\\s*`, 'g');
+
+// Older chats used one st/sc/sd per plain-text entry. Combine those entries into
+// the current row format before indexing, so editing one never drops the rest.
+export function normalizeLegacyTraits(status) {
+    const sx=tag(status,'sx');
+    if(!sx)return status;
+    let content=sx[1];
+    for(const name of ['st','sc','sd']) {
+        const re=new RegExp(`<${name}>([\\s\\S]*?)</${name}>`,'g');
+        const matches=[...content.matchAll(re)];
+        if(!matches.length)continue;
+        if(matches.length===1&&(/<sr>/.test(matches[0][1])||['','None'].includes(matches[0][1].trim())))continue;
+        const rows=matches.map(m=>{
+            const inner=m[1];
+            if(!inner.trim()||inner.trim()==='None')return '';
+            if(inner.includes('<sr>'))return inner;
+            // Structural wrappers only: keep the original encoded payload verbatim.
+            return `<sr>${inner}</sr>`;
+        }).join('');
+        const first=matches[0].index;
+        for(const m of matches.reverse())content=content.slice(0,m.index)+content.slice(m.index+m[0].length);
+        content=content.slice(0,first)+`<${name}>${rows||'None'}</${name}>`+content.slice(first);
+    }
+    return status.replace(sx[0],()=>`<sx>${content}</sx>`);
+}
 
 export function detailBlocks(text) {
     const stack = [], blocks = [];
@@ -100,7 +126,7 @@ function setField(record, key, value) {
 
 export class Tracker {
     constructor(snapshot='') {
-        this.original=snapshot; this.status=tag(snapshot,'ts')?.[0]??'';
+        this.original=snapshot; this.status=normalizeLegacyTraits(tag(snapshot,'ts')?.[0]??'');
         check(!/^<ts>\s*\{/.test(this.status),'Legacy JSON status requires conversion to the tagged format first');
         this.records=[]; this.changed=new Set(); this.values=null; this.body=tag(this.status,'sb')?.[1]??'Unknown';
         const mapping=/<!-- TD_IDS ([\s\S]*?) -->/.exec(snapshot);
