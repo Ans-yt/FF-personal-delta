@@ -1,48 +1,59 @@
-import { commitMessage, restoreMessage } from './runtime.js';
+import { commitPending, restoreMessage } from './runtime.js?v=1.1.0';
+import { installLayout } from './layout.js?v=1.1.0';
 
 const label='Tensura Delta';
 const context=()=>SillyTavern.getContext();
-function report(error) {
+const failures=new WeakMap();
+function report(error,message) {
+    // Incomplete streamed blocks are retried at the next update/completion event.
+    if(error.message.includes('Expected one complete delta'))return;
+    if(message&&failures.get(message)===message.mes)return;
+    if(message)failures.set(message,message.mes);
     console.error(`[${label}]`,error);
-    globalThis.toastr?.error(`${error.message} Original delta kept; edit it and save, or use /td-repair.`,label,{timeOut:12000,preventDuplicates:true});
+    globalThis.toastr?.error(`${error.message} The original update is preserved; automatic retry runs after edits and when the chat opens.`,label,{timeOut:10000,preventDuplicates:true});
 }
 async function process(index) {
     const ctx=context();
-    if(!Number.isInteger(Number(index)))return;
-    index=Number(index);
-    try {if(!commitMessage(ctx,index))return;}catch(error){report(error);return;}
+    const through=index===undefined?ctx.chat.length-1:Number(index);
+    if(!Number.isInteger(through)||through<0)return;
+    // All commits happen synchronously before render/save can emit another event.
+    const result=commitPending(ctx,through);
+    if(result.error)report(result.error.cause,ctx.chat[result.error.index]);
+    if(!result.changed.length)return;
     try {
-        ctx.updateMessageBlock(index,ctx.chat[index]);
-        // Core's saveChat currently logs server errors rather than throwing them.
-        // Explicitly use its normal persistence path; never invent a success receipt.
+        for(const i of result.changed) {
+            if(context().chat!==ctx.chat)return;
+            await ctx.updateMessageBlock(i,ctx.chat[i]);
+        }
+        if(context().chat!==ctx.chat)return;
         await ctx.saveChat();
     } catch(error) {
         console.error(`[${label}] Could not render/save reconstructed message`,error);
-        globalThis.toastr?.error('Snapshot reconstructed, but rendering or saving failed. Original delta is retained in message metadata; check the browser console.',label);
+        globalThis.toastr?.error('Tracker reconstructed, but rendering or saving failed. The original delta is retained in message metadata.',label);
     }
 }
 
 const ctx=context();
-const events=ctx.eventTypes??ctx.event_types;
+const events=ctx.eventTypes??ctx.event_types??{};
 for(const key of ['MESSAGE_RECEIVED','MESSAGE_EDITED','MESSAGE_UPDATED','MESSAGE_SWIPED']) {
     if(events[key])ctx.eventSource.on(events[key],process);
 }
-// MESSAGE_RECEIVED is the primary hook for streaming and non-streaming replies.
-// GENERATION_ENDED's argument is chat length, not a message index.
-if(events.GENERATION_ENDED)ctx.eventSource.on(events.GENERATION_ENDED,()=>process(context().chat.length-1));
+if(events.GENERATION_ENDED)ctx.eventSource.on(events.GENERATION_ENDED,()=>process());
+if(events.CHAT_CHANGED)ctx.eventSource.on(events.CHAT_CHANGED,()=>process());
 
 if(ctx.SlashCommandParser&&ctx.SlashCommand) {
     const add=(name,helpString,callback)=>ctx.SlashCommandParser.addCommandObject(ctx.SlashCommand.fromProps({name,helpString,callback}));
-    add('td-repair','Apply a complete delta in the latest assistant message, or supply its zero-based message index.',async(_args,value)=>{
-        const c=context();const n=String(value??'').trim();
-        const index=n?Number(n):c.chat.findLastIndex(m=>!m.is_user&&!m.is_system);
-        await process(index);return '';
+    add('td-repair','Optional: retry pending assistant deltas through the supplied index (all pending messages by default).',async(_args,value)=>{
+        const n=String(value??'').trim();await process(n?Number(n):undefined);return '';
     });
     add('td-restore','Restore the original delta for the latest assistant message, or supply its zero-based index. Does not overwrite edits.',async(_args,value)=>{
-        const c=context();const n=String(value??'').trim();
+        const c=context(),n=String(value??'').trim();
         const index=n?Number(n):c.chat.findLastIndex(m=>!m.is_user&&!m.is_system);
-        try {restoreMessage(c,index);c.updateMessageBlock(index,c.chat[index]);await c.saveChat();}catch(error){report(error);}
+        try {restoreMessage(c,index);await c.updateMessageBlock(index,c.chat[index]);await c.saveChat();}catch(error){report(error);}
         return '';
     });
 }
-console.info(`[${label}] 1.0.1 loaded. Existing display Regex remains responsible for the UI.`);
+installLayout();
+// Existing failed updates are retried automatically on installation/reload.
+await process();
+console.info(`[${label}] 1.1.0 loaded. Automatic recovery and compact tracker spacing enabled.`);

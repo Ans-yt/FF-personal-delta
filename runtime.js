@@ -1,6 +1,18 @@
-import { mergeMessage, previousSnapshot } from './engine.js';
+import { mergeMessage, previousSnapshot } from './engine.js?v=1.1.0';
 
 export const KEY = 'tensura_saved_delta_v1';
+
+// Replay unresolved assistant messages in order so later updates have a valid base.
+// A bad transaction remains untouched and stops dependent transactions.
+export function commitPending(context, through=context.chat.length-1) {
+    const changed=[];
+    let error=null;
+    for(let i=0;i<=through&&i<context.chat.length;i++) {
+        try {if(commitMessage(context,i))changed.push(i);}
+        catch(cause) {error={index:i,cause};break;}
+    }
+    return {changed,error};
+}
 
 // Synchronous calculation and commit before the first await prevents duplicate events
 // from seeing a half-applied transaction. A completed message contains no delta.

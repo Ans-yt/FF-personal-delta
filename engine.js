@@ -6,9 +6,21 @@ const tag = (text, name) => new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(t
 const idPattern = /^[A-Za-z][A-Za-z0-9_-]{0,79}$/;
 const destinations = ['sw','so','ss','st','sc','sd','si/Materials','si/Objects','si/Skill orbs','si/Equipment','gm','fac'];
 const prefixes = {sw:'wpn',so:'eqp',ss:'skl',st:'ttl',sc:'cnd',sd:'mod',gm:'gm',fac:'fac','si/Materials':'mat','si/Objects':'obj','si/Skill orbs':'orb','si/Equipment':'eqp'};
-const labels = ['ID','Name','Quantity','Type','Class','Grade','Slot','Properties','Composition','Uses','Orb skill/effect','Skill effect','Goal','Intel','Fibs','State','Conflict','Relations','Text'];
-// Effect is a legacy snapshot label, not an allowed delta field.
-const labelRe = new RegExp(`(^|;\\s*)(${[...labels,'Effect'].join('|')}):\\s*`, 'g');
+const labels = ['ID','Name','Quantity','Type','Class','Grade','Slot','Properties','Composition','Uses','Orb skill/effect','Skill effect','Goal','Intel','Fibs','State','Conflict','Relations','Text','Effect'];
+// Accept Effect from legacy snapshots and generated deltas without losing its text.
+const labelRe = new RegExp(`(^|[;|]\\s*)(${labels.join('|')}):\\s*`, 'g');
+
+// Recover only an unambiguous ID prefix; never discard the description following it.
+function cleanId(value) {
+    if (typeof value !== 'string') return null;
+    const m=/^\s*([A-Za-z][A-Za-z0-9_-]{0,79})(?=\s*(?:$|[;|]))/.exec(value);
+    return m?.[1] ?? null;
+}
+function freshId(destination, reserved) {
+    let n=1, id;
+    do { id=`${prefixes[destination]}_${String(n++).padStart(2,'0')}`; } while(reserved.has(id));
+    return id;
+}
 
 // Older chats used one st/sc/sd per plain-text entry. Combine those entries into
 // the current row format before indexing, so editing one never drops the rest.
@@ -130,7 +142,17 @@ export class Tracker {
         check(!/^<ts>\s*\{/.test(this.status),'Legacy JSON status requires conversion to the tagged format first');
         this.records=[]; this.changed=new Set(); this.values=null; this.body=tag(this.status,'sb')?.[1]??'Unknown';
         const mapping=/<!-- TD_IDS ([\s\S]*?) -->/.exec(snapshot);
-        this.idMap=mapping?JSON.parse(mapping[1]):{};
+        this.idMap=Object.create(null);
+        if(mapping) {
+            const parsed=JSON.parse(mapping[1]);
+            check(parsed&&typeof parsed==='object'&&!Array.isArray(parsed),'Invalid TD_IDS mapping');
+            for(const [oldId,position] of Object.entries(parsed)) {
+                const id=cleanId(oldId);
+                if(!id||id==='body')continue;
+                // An active location wins over a retired entry for the same repaired ID.
+                if(!Object.hasOwn(this.idMap,id)||this.idMap[id]===null)this.idMap[id]=position;
+            }
+        }
         const sections={};
         for(const d of destinations) {
             if(d==='gm'||d==='fac') sections[d]=htmlSection(snapshot,d)?.raw??'';
@@ -139,34 +161,50 @@ export class Tracker {
         }
         const reserved=new Set(Object.keys(this.idMap));
         for(const d of destinations) for(const [i,raw] of rowsFrom(sections[d],d).entries()) {
-            const fields=fieldsOf(raw,d); if(fields.ID) reserved.add(fields.ID);
+            const fields=fieldsOf(raw,d); if(cleanId(fields.ID)) reserved.add(cleanId(fields.ID));
         }
         const used=new Set(['body']);
-        for(const d of destinations) for(const [i,raw] of rowsFrom(sections[d],d).entries()) {
+        for(const d of destinations) for(const [i,sourceRaw] of rowsFrom(sections[d],d).entries()) {
+            let raw=sourceRaw;
             const fields=fieldsOf(raw,d);
-            let id=fields.ID||Object.entries(this.idMap).find(([,v])=>Array.isArray(v)&&v[0]===d&&v[1]===i)?.[0];
-            if(!id) { let n=1; do {id=`${prefixes[d]}_${String(n++).padStart(2,'0')}`;} while(reserved.has(id)||used.has(id)); }
-            check(idPattern.test(id)&&!used.has(id),`Duplicate or invalid ID: ${id}`);
+            let id=cleanId(fields.ID)||Object.entries(this.idMap).find(([,v])=>Array.isArray(v)&&v[0]===d&&v[1]===i)?.[0];
+            if(!id||used.has(id))id=freshId(d,new Set([...reserved,...used]));
+            if(fields.ID&&fields.ID!==id) {
+                // Replace only the ID token. Keep semicolon-separated legacy effect text intact.
+                raw=raw.replace(/(\bID:\s*)[^;|<]*/,(_m,prefix)=>prefix+id);
+                fields.ID=id;
+                this.changed.add(d);
+            }
+            check(idPattern.test(id),`Invalid ID: ${id}`);
             used.add(id); this.records.push({id,destination:d,raw,fields});
         }
         this.reserved=new Set([...reserved,...used]);
     }
     get(id) {const r=this.records.find(r=>r.id===id);check(r,`Unknown ID: ${id}`);return r;}
     apply(ops) {
-        for(const op of ops) {
+        const aliases=new Map();
+        for(const inputOp of ops) {
+            const op=Array.isArray(inputOp)?[...inputOp]:inputOp;
+            if(Array.isArray(op)&&op[0]!=='a'&&op[0]!=='v'&&aliases.has(op[1]))op[1]=aliases.get(op[1]);
             check(Array.isArray(op),'Each operation must be a JSON array');
             const [code,id,key,value]=op;
             if(code==='v') {check(op.length===3&&typeof id==='string'&&typeof key==='string','v needs magicules and EP strings');check(!this.values,'Duplicate v');this.values=[id,key];continue;}
             if(code==='a') {
-                const destination=id, newId=key, fields=value;
-                check(op.length===4&&destinations.includes(destination)&&idPattern.test(newId)&&!this.reserved.has(newId),'Invalid destination or duplicate/reused ID');
+                const destination=id, fields=value; let newId=cleanId(key);
+                check(op.length===4&&destinations.includes(destination)&&newId&&idPattern.test(newId),'Invalid destination or duplicate/reused ID');
                 check(fields&&typeof fields==='object'&&!Array.isArray(fields),'a needs a field object');
                 for(const [k,v] of Object.entries(fields)) check(labels.includes(k)&&k!=='ID'&&['string','number'].includes(typeof v),`Invalid new field: ${k}`);
                 check(destination==='gm'?['R','T','D'].includes(fields.Type)&&typeof fields.Text==='string':typeof fields.Name==='string','Missing record name or GM fields');
                 if('Quantity'in fields) check(Number.isFinite(fields.Quantity)&&fields.Quantity>0,'New quantity must be positive');
+                if(this.reserved.has(newId)) {
+                    const existing=this.records.find(r=>r.id===newId);
+                    if(existing&&existing.destination===destination&&Object.entries(fields).every(([k,v])=>existing.fields[k]===v))continue;
+                    const originalId=key;newId=freshId(destination,this.reserved);aliases.set(originalId,newId);
+                }
                 const r={id:newId,destination,fields:{...fields},raw:''};r.raw=serialize(r);this.records.push(r);this.reserved.add(newId);this.changed.add(destination);continue;
             }
             if(code==='s'&&id==='body') {check(op.length===4&&key==='Name'&&typeof value==='string','Body requires Name string');this.body=escapeText(value);this.changed.add('sb');continue;}
+            if(code==='d'&&op.length===2&&!this.records.some(r=>r.id===id)&&this.reserved.has(id))continue;
             const r=this.get(id);this.changed.add(r.destination);
             if(code==='s') {check(op.length===4,'s needs ID, field and value');setField(r,key,value);if(key==='Quantity'&&value===0)this.records.splice(this.records.indexOf(r),1);}
             else if(code==='q') {
@@ -219,7 +257,7 @@ export class Tracker {
         // Include retired IDs so newly generated records cannot reuse deleted IDs.
         for(const id of this.reserved)if(id!=='body'&&!Object.hasOwn(map,id))map[id]=null;
         blocks.push(`<!-- TD_IDS ${JSON.stringify(map)} -->`);
-        return blocks.join('\n\n');
+        return blocks.join('\n');
     }
 }
 
@@ -238,7 +276,13 @@ export function mergeMessage(text, baseline='') {
     if(!text.includes('<delta>'))return {text,changed:false};
     const matches=[...text.matchAll(/<delta>([\s\S]*?)<\/delta>/g)];
     check(matches.length===1,'Expected one complete delta block; unfinished or multiple blocks are not applied');
-    const delta=matches[0], containers=snapshots(text);
+    let delta=matches[0], containers=snapshots(text);
+    // Older replies and manually pasted assistant updates may contain a bare delta.
+    if(!containers.some(m=>m.index<=delta.index&&m.index+m[0].length>=delta.index+delta[0].length)) {
+        const wrapped='<internal_states><details><summary>INTERNAL STATES</summary>'+delta[0]+'</details></internal_states>';
+        text=text.slice(0,delta.index)+wrapped+text.slice(delta.index+delta[0].length);
+        delta=[...text.matchAll(/<delta>([\s\S]*?)<\/delta>/g)][0];containers=snapshots(text);
+    }
     const container=containers.find(m=>m.index<=delta.index&&m.index+m[0].length>=delta.index+delta[0].length);
     check(container,'Delta must be inside a complete internal_states block');
     const inline=containers.filter(m=>m.index<container.index&&!m[0].includes('<delta>')).at(-1);
@@ -247,7 +291,7 @@ export function mergeMessage(text, baseline='') {
     const state=new Tracker(ownBase??inline?.[0]??baseline);
     const lines=delta[1].trim().split(/\r?\n/).filter(l=>l.trim());
     const ops=lines.map((line,i)=>{try{return JSON.parse(line);}catch{throw new Error(`Invalid JSON on delta line ${i+1}`);}});
-    check(!state.status||ops.some(o=>o[0]==='v'),'Existing Status requires current magicules and EP (v)');
+    // A delta without v leaves established resource values unchanged.
     state.apply(ops);
     let replacement=container[0];
     // Remove only the three static trackers, leaving every other generated section intact.
@@ -257,6 +301,8 @@ export function mergeMessage(text, baseline='') {
     for(const m of replacement.matchAll(/<!-- TD_IDS [\s\S]*? -->/g))removals.push({start:m.index,end:m.index+m[0].length});
     for(const r of removals.sort((a,b)=>b.start-a.start))replacement=replacement.slice(0,r.start)+replacement.slice(r.end);
     replacement=replacement.replace(delta[0],()=>state.render());
+    // Blank block boundaries become paragraph/BR gaps under Markdown rendering.
+    replacement=replacement.replace(/(<\/details>|<\/ts>|<!-- TD_IDS [\s\S]*? -->)\s+(?=<(?:details|ts)\b|<!-- TD_IDS)/g,'$1\n');
     let output=text.slice(0,container.index)+replacement+text.slice(container.index+container[0].length);
     // Continuations leave one current Internal States snapshot, preserving narrative.
     for(const old of containers.filter(m=>m.index<container.index).reverse()) {
